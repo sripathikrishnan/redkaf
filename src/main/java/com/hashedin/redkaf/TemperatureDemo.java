@@ -1,21 +1,22 @@
 package com.hashedin.redkaf;
 
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.Node;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
-import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.KStream;
-import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.kstream.Windowed;
-import org.apache.kafka.streams.kstream.WindowedSerdes;import org.apache.kafka.streams.state.StoreBuilder;
-
-import java.time.Duration;
-import java.util.Properties;
-import java.util.concurrent.CountDownLatch;
 
 /**
  * Demonstrates, using the high-level KStream DSL, how to implement an IoT demo application
@@ -49,7 +50,7 @@ import java.util.concurrent.CountDownLatch;
 public class TemperatureDemo {
 
     // threshold used for filtering max temperature values
-    private static final int TEMPERATURE_THRESHOLD = 20;
+    private static final int TEMPERATURE_THRESHOLD = 35;
     // window size within which the filtering is applied
     private static final int TEMPERATURE_WINDOW_SIZE = 5;
 
@@ -86,7 +87,13 @@ public class TemperatureDemo {
         // need to override key serde to Windowed<String> type
         max.to("iot-temperature-max");
 
-        final KafkaStreams streams = new KafkaStreams(builder.build(), props, new RedKafkaClientSupplier());
+        String clusterId = "redkaf";
+		Node node = new Node(1, "localhost", 6379);
+		MockKafka kafka = new MockKafka(clusterId, Collections.singleton(node));
+		
+		createTopics(kafka);
+		sendSomeTemperatures(kafka);
+        final KafkaStreams streams = new KafkaStreams(builder.build(), props, new RedKafkaClientSupplier(kafka));
         final CountDownLatch latch = new CountDownLatch(1);
 
         // attach shutdown handler to catch control-c
@@ -106,4 +113,20 @@ public class TemperatureDemo {
         }
         System.exit(0);
     }
+
+	private static void createTopics(MockKafka kafka) {
+		NewTopic source = new NewTopic("iot-temperature", 1, (short) 0);
+		NewTopic dest = new NewTopic("iot-temperature-max", 1, (short) 0);
+		
+		kafka.createTopics(Arrays.asList(source, dest), null);
+	}
+
+	private static void sendSomeTemperatures(MockKafka kafka) {
+		int temperatures[] = new int[]{30, 31, 45, 45, 20, 23, 38};
+		for(int temperature : temperatures) {
+			ProducerRecord<byte[], byte[]> record = new ProducerRecord<byte[], byte[]>("iot-temperature", 0, 
+					System.currentTimeMillis(), new byte[0], String.valueOf(temperature).getBytes()); 
+			kafka.send(record, 0);
+		}
+	}
 }
