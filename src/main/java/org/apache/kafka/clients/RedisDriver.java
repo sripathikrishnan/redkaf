@@ -13,6 +13,8 @@ import java.util.Set;
 
 import org.apache.kafka.clients.admin.CreateTopicsOptions;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.clients.admin.TopicListing;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.Cluster;
@@ -196,6 +198,18 @@ public class RedisDriver implements AutoCloseable {
 		}
 	}
 	
+
+	public List<TopicListing> listTopics() {
+		List<TopicListing> topics = new ArrayList<>();
+		try(Jedis jedis = jedisPool.getResource()) {
+			Set<String> topicNames = jedis.smembers(ALL_TOPICS_KEY);
+			for(String topicName : topicNames) {
+				topics.add(new TopicListing(topicName, isInternalTopic(topicName)));
+			}
+			return topics;
+		}
+	}
+	
 	public void createTopics(Collection<NewTopic> newTopics, CreateTopicsOptions options) {
 		try(Jedis jedis = jedisPool.getResource()) {
 			Pipeline pipeline = jedis.pipelined();
@@ -209,9 +223,47 @@ public class RedisDriver implements AutoCloseable {
 			}
 			pipeline.syncAndReturnAll();
 		}
-		
+	}
+
+	public void deleteTopics(Collection<String> _topics) {
+		/*We want a deterministic iteration order, so convert Collection to ArrayList*/
+		List<String> topics = new ArrayList<>(_topics);
+		try(Jedis jedis = jedisPool.getResource()) {
+			Pipeline pipeline = jedis.pipelined();
+			for(String topic : topics) {
+				pipeline.hget(getKeyForTopic(topic), FIELD_NUM_PARTITIONS);
+			}
+			List<Object> partitionCounts = pipeline.syncAndReturnAll();
+			
+			/*
+			 * TODO: there is a race condition because we are reading numPartitions and then deleting keys
+			 * To fix - we can move this to lua or use a watch 
+			 */
+			pipeline = jedis.pipelined();
+			for(int i=0; i<topics.size(); i++) {
+				String topic = topics.get(i);
+				String _numPartitions = (String)partitionCounts.get(i);
+				int numPartitions = 0;
+				if(_numPartitions != null && _numPartitions.length() > 0) {
+					numPartitions = Integer.parseInt(_numPartitions);
+				}
+				pipeline.srem(ALL_TOPICS_KEY, topic);
+				pipeline.del(getKeyForTopic(topic));
+				for(int j=0; j<numPartitions; j++) {
+					pipeline.del(getKeyForTopicPartition(new TopicPartition(topic, j)));
+				}
+			}
+			pipeline.sync();
+		}
+	}
+
+	public Node leaderNode() {
+		return node;
 	}
 	
+	public boolean isInternalTopic(String topicName) {
+		return determineIfInternalTopic(topicName);
+	}
 	private static boolean determineIfInternalTopic(String topicName) {
 		/*
 		 * Sri: Don't know how Kafka decides if a topic is internal or not
@@ -272,4 +324,5 @@ public class RedisDriver implements AutoCloseable {
 			throw new IllegalArgumentException("Invalid value " + val + ", expected either true or false");
 		}
 	}
+
 }

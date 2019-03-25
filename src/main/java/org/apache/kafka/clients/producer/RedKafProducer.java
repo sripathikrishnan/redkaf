@@ -176,7 +176,7 @@ public class RedKafProducer<K, V> implements Producer<K, V> {
             this.clientId = clientId;
 
             LogContext logContext = new LogContext(String.format("[Producer clientId=%s] ", clientId));
-            log = logContext.logger(KafkaProducer.class);
+            log = logContext.logger(RedKafProducer.class);
             log.trace("Starting the Kafka producer");
 
             this.partitioner = config.getConfiguredInstance(ProducerConfig.PARTITIONER_CLASS_CONFIG, Partitioner.class);
