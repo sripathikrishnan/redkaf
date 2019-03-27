@@ -279,6 +279,4 @@ public class RedKafAdminClient extends AdminClient {
             return clientId;
         return "adminclient-" + ADMIN_CLIENT_ID_SEQUENCE.getAndIncrement();
     }
-
-	
 }

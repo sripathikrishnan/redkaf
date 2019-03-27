@@ -3,6 +3,7 @@ package org.apache.kafka.clients;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -10,11 +11,17 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import org.apache.kafka.clients.admin.CreateTopicsOptions;
 import org.apache.kafka.clients.admin.NewTopic;
-import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.clients.admin.TopicListing;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.MyTopicPartitionState;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.Cluster;
@@ -23,6 +30,9 @@ import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.serialization.Serdes;
 
 import com.hashedin.redkaf.KafkaRedisOffsetMapper;
 
@@ -57,17 +67,32 @@ public class RedisDriver implements AutoCloseable {
 	private static final String TOPIC_PARTITION_KEY_PREFIX = "__redkaf__.topic.";
 	private static final String TOPIC_PARTITION_KEY_SUFFIX = ".partition.";
 	
-	private static final ProtocolCommand XADD = new ProtocolCommand() {
+	/*
+	 * A redis hash to store the committed offsets for each consumer
+	 * The field name is a combination of (consumer group, consumer, topic partition)
+	 * The value is a long representing the last commit for that consumer
+	 */
+	private static final String COMMITTED_OFFSETS_KEY = "__{redkaf}__committed_offsets";
+	
+	private static enum StreamCommand implements ProtocolCommand {
+		XRANGE, XADD, XREAD, XREVRANGE;
+		
+		private final byte[] raw;
+
+		StreamCommand() {
+			raw = this.name().getBytes();
+		}
 		@Override
 		public byte[] getRaw() {
-			return "xadd".getBytes();
+			return raw;
 		}
-	};
+		
+	}
 	
-	private static final byte[] ASTERISK = "*".getBytes();
-	private static final byte[] KEY = "__redkaf_k".getBytes();
-	private static final byte[] VALUE = "__redkaf_v".getBytes();
-	private static final byte[] TIMESTAMP = "__redkaf_t".getBytes();
+	private static final String ASTERISK = "*";
+	private static final String KEY = "__redkaf_k";
+	private static final String VALUE = "__redkaf_v";
+	private static final String TIMESTAMP = "__redkaf_t";
 	private static final String FIELD_NUM_PARTITIONS = "numPartitions";
 	private static final String FIELD_IS_INTERNAL_TOPIC = "isInternalTopic";
 	
@@ -114,8 +139,8 @@ public class RedisDriver implements AutoCloseable {
 		
 		try(Jedis jedis = jedisPool.getResource()) {
 			String redisKey = getKeyForTopicPartition(topicPartition);
-			jedis.getClient().sendCommand(XADD, redisKey.getBytes(), ASTERISK, 
-					KEY, key, VALUE, value, TIMESTAMP, longToBytes(timestamp));
+			jedis.getClient().sendCommand(StreamCommand.XADD, redisKey.getBytes(), ASTERISK.getBytes(), 
+					KEY.getBytes(), key, VALUE.getBytes(), value, TIMESTAMP.getBytes(), longToBytes(timestamp));
 			byte result [] = jedis.getClient().getBinaryBulkReply();
 			String redisEntryId = new String(result);
 			long offset = KafkaRedisOffsetMapper.toKafkaOffset(redisEntryId);
@@ -210,6 +235,30 @@ public class RedisDriver implements AutoCloseable {
 		}
 	}
 	
+	public Map<String, List<PartitionInfo>> listTopicsWithPartitions() {
+		Map<String, List<PartitionInfo>> topicsWithPartitions = new HashMap<>();
+		try(Jedis jedis = jedisPool.getResource()) {
+			List<String> topics = new ArrayList<>(jedis.smembers(ALL_TOPICS_KEY));
+			
+			Pipeline pipeline = jedis.pipelined();
+			for(String topic : topics) {
+				pipeline.hget(getKeyForTopic(topic), FIELD_NUM_PARTITIONS);
+			}
+			List<Object> partitionsByTopic = pipeline.syncAndReturnAll();
+			
+			for(int i=0; i<topics.size(); i++) {
+				String topic = topics.get(i);
+				int numPartitions = Integer.parseInt((String)partitionsByTopic.get(i));
+				List<PartitionInfo> pinfos = new ArrayList<>();
+				for(int j=0; j<numPartitions; j++) {
+					pinfos.add(toPartitionInfo(topic, j));
+				}
+				topicsWithPartitions.put(topic, pinfos);
+			}
+		}
+		return topicsWithPartitions;
+	}
+	
 	public void createTopics(Collection<NewTopic> newTopics, CreateTopicsOptions options) {
 		try(Jedis jedis = jedisPool.getResource()) {
 			Pipeline pipeline = jedis.pipelined();
@@ -287,12 +336,31 @@ public class RedisDriver implements AutoCloseable {
 		return node.toString();
 	}
 
-	private String getKeyForTopic(String topic) {
+	private static final String getKeyForTopic(String topic) {
 		return TOPIC_KEY_PREFIX + topic;
 	}
 	
-	private String getKeyForTopicPartition(TopicPartition topicPartition) {
+	private static final String getKeyForTopicPartition(TopicPartition topicPartition) {
 		return TOPIC_PARTITION_KEY_PREFIX + topicPartition.topic() + TOPIC_PARTITION_KEY_SUFFIX + topicPartition.partition();
+	}
+	
+	private static final TopicPartition getTopicPartitionFromKey(String key) {
+		Pattern pattern = Pattern.compile(TOPIC_PARTITION_KEY_PREFIX + "(.*)" + TOPIC_PARTITION_KEY_SUFFIX + "(\\d*)");
+		Matcher matcher = pattern.matcher(key);
+		if(!matcher.matches()) {
+			throw new IllegalStateException("Key does not match a TopicPartition - " + key);
+		}
+		
+		String topic = matcher.group(1);
+		int partition = Integer.parseInt(matcher.group(2));
+		return new TopicPartition(topic, partition);
+	}
+	
+	private static final String getFieldNameForCommittedOffsets(String groupId, String clientId, TopicPartition partition) {
+		StringBuilder builder = new StringBuilder();
+		builder.append(groupId).append("-").append(clientId).append("-")
+				.append(partition.topic()).append("-").append(partition.partition());
+		return builder.toString();
 	}
 
 	@Override
@@ -300,20 +368,196 @@ public class RedisDriver implements AutoCloseable {
 		jedisPool.close();
 	}
 	
-	static final byte[] longToBytes(long x) {
+	public Collection<String> getTopicsMatching(Pattern pattern) {
+		Set<String> matchingTopics = new HashSet<>();
+		try(Jedis jedis = jedisPool.getResource()) {
+			Set<String> topics = jedis.smembers(ALL_TOPICS_KEY);
+			for(String topic : topics) {
+				if(pattern.matcher(topic).matches()) {
+					matchingTopics.add(topic);
+				}
+			}
+		}
+		return matchingTopics;
+	}
+
+	@SuppressWarnings("unchecked")
+	public <K,V> Map<TopicPartition, List<ConsumerRecord<K,V>>> poll(Set<TopicPartition> assignments,
+			Map<TopicPartition, MyTopicPartitionState> partitionStates, long timeout,
+			Deserializer<K> keyDeserializer, Deserializer<V> valueDeserializer) {
+		
+		/*
+		 * - Generate a list of redis keys from assignments, eliminating TopicPartition's that are paused
+		 * - For each redis key, find the position from partitionStates
+		 * - If position is null or < 0, determine position based on offsetResetStrategy
+		 * - Convert the position to redis stream entry id using KafkaRedisOffsetMapper
+		 * - Then construct XREAD command in the format 
+		 * - XREAD COUNT 20 BLOCK <timeout> STREAMS key1 key2 key3 ... entryId1 entryId2 entryId3 ...
+		 * - Convert each record into a ConsumerRecord
+		 */
+		long offset;
+		List<String> streamKeys = new ArrayList<>();
+		List<String> streamEntryIds = new ArrayList<>();
+		for(TopicPartition partition : assignments) {
+			/*step 1: If the partition is not paused, find the offset to poll from */
+			MyTopicPartitionState state = partitionStates.get(partition);
+			if (state != null) {
+				if(state.isPaused()) {
+					continue;
+				}
+				offset = state.getOffset();
+				if(offset < 0) {
+					if(OffsetResetStrategy.EARLIEST.equals(state.getOffsetResetStrategy())) {
+						offset = getLogStartOffset(partition).offset();
+					}
+					else if (OffsetResetStrategy.LATEST.equals(state.getOffsetResetStrategy())) {
+						offset = getHighWatermark(partition).offset();
+					}
+					else {
+						throw new IllegalArgumentException("Partition " + partition + 
+								" does not have an offset and does not have an OffsetResetStrategy");
+					}
+				}
+			}
+			else {
+				/*TODO: do we use the defaultOffsetResetStrategy over here?*/
+				throw new IllegalStateException("Missing state for TopicPartition " + partition);
+			}
+			
+			/*step 2: Construct the stream keys and corresponding ids */
+			streamKeys.add(getKeyForTopicPartition(partition));
+			streamEntryIds.add(KafkaRedisOffsetMapper.toRedisEntryId(offset));
+		}
+		
+		/* Step 3: Generate the command arguments */
+		List<String> arguments = new ArrayList<>();
+		arguments.addAll(Arrays.asList("count", "20", "block", String.valueOf(timeout), "streams"));
+		arguments.addAll(streamKeys);
+		arguments.addAll(streamEntryIds);
+		
+		/* Step 4: Execute the command */
+		List<Object> response;
+		try(Jedis jedis = jedisPool.getResource()) {
+			jedis.getClient().sendCommand(StreamCommand.XREAD, arguments.toArray(new String[arguments.size()]));
+			response = jedis.getClient().getObjectMultiBulkReply();
+		}
+		
+		/* Step 5: Convert the response to a ConsumerRecord*/
+		Map<TopicPartition, List<ConsumerRecord<K,V>>> toReturn = new HashMap<>();
+		for(Object obj : response) {
+			List<Object> recordsAndPartition = (List<Object>)obj;
+			String redisKey = new String((byte[])recordsAndPartition.get(0));
+			TopicPartition tp = getTopicPartitionFromKey(redisKey);
+			
+			List<Object> rawRecords = (List<Object>)recordsAndPartition.get(1);
+			List<ConsumerRecord<K, V>> records = rawRecords.stream()
+					.map(x -> deserialize(x, tp, keyDeserializer, valueDeserializer))
+					.collect(Collectors.toList());
+			
+			toReturn.put(tp, records);
+		}
+		return toReturn;
+	}
+
+	@SuppressWarnings("unchecked")
+	private <K,V> ConsumerRecord<K,V> deserialize(Object obj, TopicPartition tp, Deserializer<K> keyDeserializer, Deserializer<V> valueDeserializer) {
+		List<Object> rawRecord = (List<Object>)obj;
+		String redisEntryId = new String((byte[])rawRecord.get(0));
+		List<byte[]> kvpairs = (List<byte[]>)rawRecord.get(1);
+		
+		K key = null;
+		V value = null;
+		long timestamp = -1;
+		int serializedKeySize = -1;
+		int serializedValueSize = -1;
+		
+		for(int i=0; i<kvpairs.size(); i+=2) {
+			String field = new String(kvpairs.get(i));
+			byte data[] = kvpairs.get(i+1);
+			if (KEY.equals(field)) {
+				serializedKeySize = data.length;
+				key = keyDeserializer.deserialize(tp.topic(), data);
+			}
+			else if (VALUE.equals(field)) {
+				serializedValueSize = data.length;
+				value = valueDeserializer.deserialize(tp.topic(), data);
+			}
+			else if (TIMESTAMP.equals(field)) {
+				timestamp = bytesToLong(data);
+			}
+			else {
+				// ignore unknown fields
+			}
+		}
+		return new ConsumerRecord<K, V>(tp.topic(), tp.partition(), KafkaRedisOffsetMapper.toKafkaOffset(redisEntryId), 
+				timestamp, TimestampType.CREATE_TIME, 0, serializedKeySize, serializedValueSize, key, value);
+	}
+	
+	public void commit(String groupId, String clientId, TopicPartition tp, long offset) {
+		String fieldName = getFieldNameForCommittedOffsets(groupId, clientId, tp);
+		try(Jedis jedis = jedisPool.getResource()) {
+			jedis.hset(COMMITTED_OFFSETS_KEY, Collections.singletonMap(fieldName, String.valueOf(offset)));
+		}
+	}
+
+	public OffsetAndMetadata getCommitted(String groupId, String clientId, TopicPartition partition) {
+		String fieldName = getFieldNameForCommittedOffsets(groupId, clientId, partition);
+		try(Jedis jedis = jedisPool.getResource()) {
+			String offsetStr = jedis.hget(COMMITTED_OFFSETS_KEY, fieldName);
+			if(offsetStr != null && !offsetStr.isEmpty()) {
+				long offset = Long.parseLong(offsetStr);
+				return new OffsetAndMetadata(offset);
+			}
+			else {
+				return null;
+			}
+		}
+	}
+	
+	public OffsetAndMetadata getLogStartOffset(TopicPartition partition) {
+		return getHighOrLowOffset(partition, false);
+	}
+
+	public OffsetAndMetadata getHighWatermark(TopicPartition partition) {
+		return getHighOrLowOffset(partition, true);
+	}
+
+	private OffsetAndMetadata getHighOrLowOffset(TopicPartition partition, boolean reverse) {
+		String redisKey = getKeyForTopicPartition(partition);
+		try(Jedis jedis = jedisPool.getResource()) {
+			if(reverse) {
+				jedis.getClient().sendCommand(StreamCommand.XREVRANGE, 
+						redisKey, "+", "-", "count", "1");
+			}
+			else {
+				jedis.getClient().sendCommand(StreamCommand.XRANGE, 
+						redisKey, "-", "+", "count", "1");
+			}
+			
+			List<Object> response = jedis.getClient().getObjectMultiBulkReply();
+			@SuppressWarnings("unchecked")
+			List<Object> firstRecord = (List<Object>)response.get(0);
+			byte[] redisEntryIdBytes = (byte[])firstRecord.get(0);
+			String redisEntryId = new String(redisEntryIdBytes);
+			long offset = KafkaRedisOffsetMapper.toKafkaOffset(redisEntryId);
+			return new OffsetAndMetadata(offset);
+		}
+	}
+	
+	private static final byte[] longToBytes(long x) {
 	    ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES);
 	    buffer.putLong(x);
 	    return buffer.array();
 	}
 
-	static final long bytesToLong(byte[] bytes) {
+	private static final long bytesToLong(byte[] bytes) {
 	    ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES);
 	    buffer.put(bytes);
 	    buffer.flip();//need flip 
 	    return buffer.getLong();
 	}
 	
-	private boolean parseBoolean(String val) {
+	private static boolean parseBoolean(String val) {
 		if("true".equalsIgnoreCase(val)) {
 			return true;
 		}
@@ -323,6 +567,27 @@ public class RedisDriver implements AutoCloseable {
 		else {
 			throw new IllegalArgumentException("Invalid value " + val + ", expected either true or false");
 		}
+	}
+	
+	public static void main(String args[]) throws Exception {
+		Map<String, Object> props = new HashMap<>();
+		props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:6379");
+		props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, Serdes.String().getClass().getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, Serdes.String().getClass().getName());
+        
+		ProducerConfig config = new ProducerConfig(props);
+		RedisDriver driver = new RedisDriver(config);
+		
+		TopicPartition tp = new TopicPartition("custom-iot-data", 0);
+		MyTopicPartitionState state = new MyTopicPartitionState(OffsetResetStrategy.EARLIEST);
+		state.setOffset(0);
+		state.setPaused(false);
+		
+		Map<TopicPartition, List<ConsumerRecord<String,String>>> records = driver.poll(Collections.singleton(tp), Collections.singletonMap(tp, state), 
+				1000, Serdes.String().deserializer(), Serdes.String().deserializer());
+		System.out.println(records);
+		
+		driver.close();
 	}
 
 }
