@@ -19,6 +19,7 @@ import org.apache.kafka.clients.admin.CreateTopicsOptions;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.TopicListing;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.MyTopicPartitionState;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
@@ -214,6 +215,9 @@ public class RedisDriver implements AutoCloseable {
 		List<PartitionInfo> partitions = new ArrayList<>();
 		String topicKey = getKeyForTopic(topic);
 		try(Jedis jedis = jedisPool.getResource()) {
+			if(!jedis.exists(topicKey)) {
+				return Collections.emptyList();
+			}
 			int numPartitions = Integer.parseInt(jedis.hget(topicKey, FIELD_NUM_PARTITIONS));
 			for(int i=0; i<numPartitions; i++) {
 				PartitionInfo partition = toPartitionInfo(topic, i);
@@ -264,6 +268,7 @@ public class RedisDriver implements AutoCloseable {
 			Pipeline pipeline = jedis.pipelined();
 			
 			for(NewTopic topic : newTopics) {
+				jedis.sadd(ALL_TOPICS_KEY, topic.name());
 				String topicKey = getKeyForTopic(topic.name());
 				Map<String, String> topicMap = new HashMap<>();
 				topicMap.put(FIELD_NUM_PARTITIONS, String.valueOf(topic.numPartitions()));
@@ -382,7 +387,7 @@ public class RedisDriver implements AutoCloseable {
 	}
 
 	@SuppressWarnings("unchecked")
-	public <K,V> Map<TopicPartition, List<ConsumerRecord<K,V>>> poll(Set<TopicPartition> assignments,
+	public <K,V> ConsumerRecords<K, V> poll(Set<TopicPartition> assignments,
 			Map<TopicPartition, MyTopicPartitionState> partitionStates, long timeout,
 			Deserializer<K> keyDeserializer, Deserializer<V> valueDeserializer) {
 		
@@ -442,6 +447,9 @@ public class RedisDriver implements AutoCloseable {
 			response = jedis.getClient().getObjectMultiBulkReply();
 		}
 		
+		if (response == null || response.isEmpty()) {
+			return null;
+		}
 		/* Step 5: Convert the response to a ConsumerRecord*/
 		Map<TopicPartition, List<ConsumerRecord<K,V>>> toReturn = new HashMap<>();
 		for(Object obj : response) {
@@ -456,7 +464,7 @@ public class RedisDriver implements AutoCloseable {
 			
 			toReturn.put(tp, records);
 		}
-		return toReturn;
+		return new ConsumerRecords<K, V>(toReturn);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -535,6 +543,10 @@ public class RedisDriver implements AutoCloseable {
 			}
 			
 			List<Object> response = jedis.getClient().getObjectMultiBulkReply();
+			if(response.isEmpty()) {
+				/*No records in this stream yet, so low and high offset are both 0*/
+				return new OffsetAndMetadata(0L);
+			}
 			@SuppressWarnings("unchecked")
 			List<Object> firstRecord = (List<Object>)response.get(0);
 			byte[] redisEntryIdBytes = (byte[])firstRecord.get(0);
@@ -578,14 +590,10 @@ public class RedisDriver implements AutoCloseable {
 		ProducerConfig config = new ProducerConfig(props);
 		RedisDriver driver = new RedisDriver(config);
 		
-		TopicPartition tp = new TopicPartition("custom-iot-data", 0);
-		MyTopicPartitionState state = new MyTopicPartitionState(OffsetResetStrategy.EARLIEST);
-		state.setOffset(0);
-		state.setPaused(false);
-		
-		Map<TopicPartition, List<ConsumerRecord<String,String>>> records = driver.poll(Collections.singleton(tp), Collections.singletonMap(tp, state), 
-				1000, Serdes.String().deserializer(), Serdes.String().deserializer());
-		System.out.println(records);
+		TopicPartition tp = new TopicPartition("streams-plaintext-input", 0);
+		driver.send(tp, new Header[0], "".getBytes(), "hello world dog cat".getBytes(), System.currentTimeMillis());
+		driver.send(tp, new Header[0], "".getBytes(), "dog monkey world".getBytes(), System.currentTimeMillis());
+		driver.send(tp, new Header[0], "".getBytes(), "monkey hello".getBytes(), System.currentTimeMillis());
 		
 		driver.close();
 	}

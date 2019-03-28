@@ -17,7 +17,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 import org.apache.kafka.clients.admin.AdminClient;
-import org.apache.kafka.clients.admin.MockAdminClient;
+import org.apache.kafka.clients.admin.RedKafAdminClient;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
@@ -26,77 +26,60 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
-import org.apache.kafka.clients.consumer.RangeAssignor;
+import org.apache.kafka.clients.consumer.RedKafConsumer;
 import org.apache.kafka.clients.consumer.internals.NoOpConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.internals.PartitionAssignor;
 import org.apache.kafka.clients.consumer.internals.PartitionAssignor.Assignment;
 import org.apache.kafka.clients.consumer.internals.PartitionAssignor.Subscription;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.clients.producer.RedKafProducer;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
-import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.config.AbstractConfig;
-import org.apache.kafka.common.config.ConfigDef;
-import org.apache.kafka.common.config.ConfigDef.Importance;
-import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.errors.ProducerFencedException;
+import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.KafkaClientSupplier;
 
 public class RedKafkaClientSupplier implements KafkaClientSupplier {
-	private final MockKafka kafka;
 	
-	public RedKafkaClientSupplier() {
-		String clusterId = "redkaf";
-		Node node = new Node(1, "localhost", 6379);
-		kafka = new MockKafka(clusterId, Collections.singleton(node));
-	}
-	
-	RedKafkaClientSupplier(MockKafka kafka) {
-		this.kafka = kafka;
-	}
-
 	@Override
 	public AdminClient getAdminClient(Map<String, Object> config) {
-		return new MockAdminClient(kafka);
+		return RedKafAdminClient.create(config);
 	}
 
 	@Override
 	public Producer<byte[], byte[]> getProducer(Map<String, Object> config) {
-		return new MyProducer(kafka);
+		config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().serializer().getClass());
+		config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().serializer().getClass());
+		
+		return new RedKafProducer<byte[], byte[]>(config);
 	}
 
 	@Override
-	public Consumer<byte[], byte[]> getConsumer(Map<String, Object> originals) {
-		ConfigDef definition = new ConfigDef()
-				.define(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
-                Type.LIST,
-                Collections.singletonList(RangeAssignor.class),
-                new ConfigDef.NonNullValidator(),
-                Importance.MEDIUM,
-                "");
-		
-		AbstractConfig config = new AbstractConfig(definition, originals);
-		List<PartitionAssignor> assignors = config.getConfiguredInstances(
-                ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
-                PartitionAssignor.class);
-		
-		return new MyConsumer(kafka, assignors);
+	public Consumer<byte[], byte[]> getConsumer(Map<String, Object> config) {
+		config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().deserializer().getClass());
+		config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().deserializer().getClass());
+		return new RedKafConsumer<byte[], byte[]>(config);
 	}
 
 	@Override
 	public Consumer<byte[], byte[]> getRestoreConsumer(Map<String, Object> config) {
-		return getConsumer(config);
+		config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().deserializer().getClass());
+		config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().deserializer().getClass());
+		return new RedKafConsumer<byte[], byte[]>(config);
 	}
 
 	@Override
 	public Consumer<byte[], byte[]> getGlobalConsumer(Map<String, Object> config) {
-		return getConsumer(config);
+		config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().deserializer().getClass());
+		config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, new Serdes.ByteArraySerde().deserializer().getClass());
+		return new RedKafConsumer<byte[], byte[]>(config);
 	}
 }
 

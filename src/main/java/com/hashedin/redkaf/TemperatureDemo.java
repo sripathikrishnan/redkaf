@@ -93,7 +93,7 @@ public class TemperatureDemo {
 		
 		createTopics(kafka);
 		sendSomeTemperatures(kafka);
-        final KafkaStreams streams = new KafkaStreams(builder.build(), props, new RedKafkaClientSupplier(kafka));
+        final KafkaStreams streams = new KafkaStreams(builder.build(), props, new RedKafkaClientSupplier());
         final CountDownLatch latch = new CountDownLatch(1);
 
         // attach shutdown handler to catch control-c

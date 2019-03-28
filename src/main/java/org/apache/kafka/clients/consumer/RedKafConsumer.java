@@ -306,16 +306,14 @@ public class RedKafConsumer<K, V> implements Consumer<K, V> {
 			return EMPTY;
 		}
 		else {
-			Map<TopicPartition, List<ConsumerRecord<K,V>>> records = driver.poll(assignments, partitionStates, timeout,
+			return driver.poll(assignments, partitionStates, timeout,
 					keyDeserializer, valueDeserializer);
-			return new ConsumerRecords<K, V>(records);
-			
 		}
 	}
 
 	@Override
 	public ConsumerRecords<K, V> poll(Duration timeout) {
-		return poll(timeout.getSeconds());
+		return poll(timeout.getSeconds() * 1000);
 	}
 
 	@Override
