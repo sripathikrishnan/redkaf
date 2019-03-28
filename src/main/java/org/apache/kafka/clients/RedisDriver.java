@@ -462,6 +462,13 @@ public class RedisDriver implements AutoCloseable {
 					.map(x -> deserialize(x, tp, keyDeserializer, valueDeserializer))
 					.collect(Collectors.toList());
 			
+			/* Update the last read record id in the partition state */
+			if (!records.isEmpty()) {
+				ConsumerRecord<K,V> lastRecord = records.get(records.size() - 1);
+				MyTopicPartitionState state = partitionStates.get(tp);
+				state.setOffset(lastRecord.offset());
+			}
+			
 			toReturn.put(tp, records);
 		}
 		return new ConsumerRecords<K, V>(toReturn);

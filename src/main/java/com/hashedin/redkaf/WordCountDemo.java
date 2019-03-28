@@ -17,6 +17,7 @@
 package com.hashedin.redkaf;
 
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 
@@ -66,9 +67,9 @@ public final class WordCountDemo {
         final KStream<String, String> source = builder.stream("streams-plaintext-input");
 
         final KTable<String, Long> counts = source
-            //.flatMapValues(value -> Arrays.asList(value.toLowerCase(Locale.getDefault()).split(" ")))
-            .groupBy((key, value) -> value)
-            .count();
+                .flatMapValues(value -> Arrays.asList(value.toLowerCase(Locale.getDefault()).split(" ")))
+                .groupBy((key, value) -> value)
+                .count();
 
         // need to override value serde to Long type
         counts.toStream().to("streams-wordcount-output", Produced.with(Serdes.String(), Serdes.Long()));

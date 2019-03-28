@@ -82,4 +82,8 @@ public class KafkaRedisOffsetMapper {
 		long redisSeqNumber = kafkaOffset & MAX_SEQ_NUMBER;
 		return redisTimestamp + "-" + redisSeqNumber;
 	}
+	
+	public static void main(String args[]) {
+		System.out.println(toRedisEntryId(15606443262607361L));
+	}
 }
